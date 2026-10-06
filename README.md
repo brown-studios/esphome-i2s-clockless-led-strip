@@ -4,8 +4,6 @@ An ESPHome component for driving a clockless LED strip with the I2S peripheral a
 
 This component is similar to the [esp32_rmt_led_strip](https://esphome.io/components/light/esp32_rmt_led_strip/) component but it is more immune to flickering.  The RMT peripheral can only buffer enough symbols for a few pixels at once and flickering occurs when the RMT interrupt cannot run fast enough to refill the buffer because the microcontroller is busy performing higher priority tasks.  Conversely, the I2S peripheral can use much bigger buffers and tolerates more interrupt latency at the cost of more memory.
 
-This implementation currently makes no effort to optimize memory usage: the I2S buffer holds three copies of all of the pixel data at a total cost of approximately 9 bytes per pixel per color channel.  It is best suited for strips of up to a few hundred LEDs.
-
 ## Component schema
 
 ```yaml

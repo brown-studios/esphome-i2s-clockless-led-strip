@@ -45,6 +45,7 @@ class I2SClocklessLedStrip final : public light::AddressableLight {
   uint8_t *color_data_{nullptr};
   uint8_t *i2s_data_{nullptr};
   std::atomic<bool> i2s_data_ready_{false};
+  size_t i2s_data_sent_{0};
 
   i2s_chan_handle_t tx_handle_{};
 };

@@ -2,10 +2,13 @@
 
 #ifdef USE_ESP32
 
+#include <algorithm>
+#include <cinttypes>
+
 #include "esphome/core/helpers.h"
 
-#include <esp_attr.h>
 #include <driver/i2s_tdm.h>
+#include <esp_attr.h>
 
 namespace esphome::i2s_clockless_led_strip {
 
@@ -19,17 +22,30 @@ constexpr const char *const ERROR_I2S = "I2S error";
 // Each bit of LED strip data gets expanded into 3 bits of I2C data, where a 0-bit expands into 100
 // (1/3 duty cycle) and a 1-bit expands into 110 (2/3 duty cycle.  Each byte of LED strip data becomes
 // one 24-bit I2S sample to be transmitted at a rate of 100000 samples per second in I2C TDM mode.
-constexpr size_t I2S_BYTES_PER_SAMPLE = 3;
 constexpr uint32_t I2S_SAMPLE_RATE_HZ = 100000;
+constexpr size_t I2S_BYTES_PER_SAMPLE = 3;
 
-// The number of I2S samples to write after the LED data to encode a 50 microsecond LED strip reset signal.
-constexpr uint32_t I2S_RESET_SAMPLES = 50 * 1000000 / I2S_SAMPLE_RATE_HZ;
-
-constexpr size_t calc_i2s_samples_with_padding(size_t color_data_bytes) {
-  // Round up to next multiple of 3 as required by the ESP-IDF programming guide for `dma_frame_num`
-  // when using 24-bit samples.
-  return (color_data_bytes + I2S_RESET_SAMPLES + 2) / 3 * 3;
+// Determine how many I2S samples are needed to feed the output for the specified duration and vice-versa.
+constexpr size_t num_i2s_samples_from_duration_us(uint32_t duration_us) {
+  return (duration_us * I2S_SAMPLE_RATE_HZ + 999999) / 1000000;
 }
+constexpr uint32_t num_i2s_samples_to_duration_us(size_t samples) {
+  return samples * 1000000ull / I2S_SAMPLE_RATE_HZ;
+}
+
+// Determine the number of I2S samples to pad with zeros after the LED data to encode the LED strip reset signal.
+constexpr uint32_t I2S_RESET_DURATION_US = 50;
+constexpr size_t I2S_RESET_SAMPLES = num_i2s_samples_from_duration_us(I2S_RESET_DURATION_US);
+constexpr size_t I2S_RESET_BYTES = I2S_RESET_SAMPLES * I2S_BYTES_PER_SAMPLE;
+
+// Determine the number of I2S samples per DMA buffer to ensure that the interrupt-driven I2S on_sent callback
+// doesn't run too frequently.  For example, if the buffers were sized to hold just 1 RGBW pixel then they would be
+// recycled approximately every 40 us (25000 Hz) which is way too fast.  The buffer duration also imposes an upper
+// bound on the maximum LED strip refresh rate.  Round up to a multiple of 3 for `dma_frame_num` as required by
+// the ESP-IDF programming guide when using 24-bit samples.
+constexpr uint32_t I2S_BUFFER_DURATION_US_IDEAL = 2500;
+constexpr size_t I2S_BUFFER_SAMPLES = (num_i2s_samples_from_duration_us(I2S_BUFFER_DURATION_US_IDEAL) + 2) / 3 * 3;
+constexpr uint32_t I2S_BUFFER_DURATION_US_ACTUAL = num_i2s_samples_to_duration_us(I2S_BUFFER_SAMPLES);
 
 I2SClocklessLedStrip::I2SClocklessLedStrip(uint8_t pin, uint16_t num_leds, light::ChannelColors channel_colors)
     : pin_(pin),
@@ -46,8 +62,10 @@ void I2SClocklessLedStrip::dump_config() {
   char channel_colors[5];
   ESP_LOGCONFIG(TAG,
       "  Channel colors: %s\n"
-      "  Number of LEDs: %u",
-      this->channel_colors_.to_string(channel_colors), this->num_leds_);
+      "  Number of LEDs: %" PRIu16 "\n"
+      "  DMA buffer: %" PRIuPTR " samples (%" PRIu32 " us)",
+      this->channel_colors_.to_string(channel_colors), this->num_leds_, I2S_BUFFER_SAMPLES,
+      I2S_BUFFER_DURATION_US_ACTUAL);
 }
 
 float I2SClocklessLedStrip::get_setup_priority() const {
@@ -75,7 +93,7 @@ void I2SClocklessLedStrip::setup() {
       .id = I2S_NUM_AUTO,
       .role = I2S_ROLE_MASTER,
       .dma_desc_num = 2,
-      .dma_frame_num = calc_i2s_samples_with_padding(this->color_data_bytes_),
+      .dma_frame_num = I2S_BUFFER_SAMPLES,
       .auto_clear_after_cb = false,
       .auto_clear_before_cb = false,
       .allow_pd = false,
@@ -172,20 +190,37 @@ void I2SClocklessLedStrip::write_state(light::LightState *state) {
     *(i2s_data++) = 0b00100100 | ((color_byte & 0x04) << 5) | ((color_byte & 0x02) << 3) | ((color_byte & 0x01) << 1);
   }
 
+  this->i2s_data_sent_ = 0;
   this->i2s_data_ready_.store(true, std::memory_order_release);
+
   this->mark_shown_();
 }
 
 bool IRAM_ATTR HOT I2SClocklessLedStrip::i2s_on_sent_callback(
     i2s_chan_handle_t handle, i2s_event_data_t *event, void *user_ctx) {
   const auto self = static_cast<I2SClocklessLedStrip *>(user_ctx);
+  const auto dma_buf = static_cast<uint8_t *>(event->dma_buf);
+  const size_t dma_buf_size = event->size;
 
-  const size_t i2s_data_bytes = self->color_data_bytes_ * I2S_BYTES_PER_SAMPLE;
   if (self->i2s_data_ready_.load(std::memory_order_acquire)) {
-    memcpy(event->dma_buf, self->i2s_data_, i2s_data_bytes);
-    self->i2s_data_ready_.store(false, std::memory_order_release);
+    const size_t i2s_data_bytes = self->color_data_bytes_ * I2S_BYTES_PER_SAMPLE;
+    if (self->i2s_data_sent_ < i2s_data_bytes) {
+      const size_t i2s_data_remaining = i2s_data_bytes - self->i2s_data_sent_;
+      if (i2s_data_remaining >= dma_buf_size) {
+        memcpy(dma_buf, self->i2s_data_ + self->i2s_data_sent_, dma_buf_size);
+      } else {
+        memcpy(dma_buf, self->i2s_data_ + self->i2s_data_sent_, i2s_data_remaining);
+        memset(dma_buf + i2s_data_remaining, 0, dma_buf_size - i2s_data_remaining);
+      }
+    } else {
+      memset(dma_buf, 0, dma_buf_size);
+    }
+    self->i2s_data_sent_ += dma_buf_size;
+    if (self->i2s_data_sent_ >= i2s_data_bytes + I2S_RESET_BYTES) {
+      self->i2s_data_ready_.store(false, std::memory_order_release);
+    }
   } else {
-    memset(event->dma_buf, 0, i2s_data_bytes);
+    memset(dma_buf, 0, dma_buf_size);
   }
   return false;
 }
