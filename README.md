@@ -1,4 +1,4 @@
-# esphome-spi-clockless-led-strip
+# esphome-i2s-clockless-led-strip
 
 An ESPHome component for driving a clockless LED strip with the I2S peripheral and DMA.  It works with the WS2811 / WS2812B / SK6812 family of devices with RGB or RGBW pixels.
 
