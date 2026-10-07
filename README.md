@@ -1,5 +1,8 @@
 # esphome-i2s-clockless-led-strip
 
+> [!NOTE]
+> This component is being upstreamed to ESPHome in [PR #20255](https://github.com/esphome/esphome/pull/20255).
+
 An ESPHome component for driving a clockless LED strip with the I2S peripheral and DMA.  It works with the WS2811 / WS2812B / SK6812 family of devices with RGB or RGBW pixels.
 
 This component is similar to the [esp32_rmt_led_strip](https://esphome.io/components/light/esp32_rmt_led_strip/) component but it is more immune to flickering.  The RMT peripheral can only buffer enough symbols for a few pixels at once and flickering occurs when the RMT interrupt cannot run fast enough to refill the buffer because the microcontroller is busy performing higher priority tasks.  Conversely, the I2S peripheral can use much bigger buffers and tolerates more interrupt latency at the cost of more memory.
